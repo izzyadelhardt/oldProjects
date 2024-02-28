@@ -1,0 +1,287 @@
+---
+title: "Spring 2023 Stat151A Final Project Code Portion"
+subtitle: "Pollution Across New York City and Long Island"
+author: "Isabel Adelhardt"
+date: "Spring 2023"
+output: pdf_document
+---
+
+```{r setup, include=FALSE, message = FALSE, Warnings = FALSE }
+knitr::opts_chunk$set(echo = TRUE)
+library(maps)
+library(pracma)
+library(data.table)
+library(dplyr)
+library(tidyr)
+library(magrittr)
+library(ggplot2)
+library(ggpubr)
+library(GGally)
+library(faux)
+library(janitor)
+library(glmnet)
+library(MASS)
+library(caret)
+library(leaps)
+```
+
+
+# Input Data
+```{r}
+#run to read in already downloaded data set
+pollution <- read.csv("pollution_us_2000_2016.csv")
+```
+
+
+# Clean Data and Prepare for Modeling
+```{r}
+#filter through data so that it only includes specified new york counties
+pollution <- pollution %>% dplyr::filter(State == "New York") 
+pollution <- dplyr::filter(pollution, County != "Steuben" & County != "Monroe")
+
+#convert dates in Date.Local from strings to Date
+pollution$Date.Local <- as.Date(pollution$Date.Local, format = "%Y-%m-%d")
+pollution <- pollution %>% 
+  dplyr::filter(between(Date.Local, as.Date("2000-05-05"), as.Date("2011-12-31")))
+
+#group by date and county and calculate daily averages
+counties <- pollution %>% 
+  dplyr::select(County, Date.Local, O3.Mean, CO.Mean, SO2.Mean, NO2.Mean) %>% 
+  group_by(County, Date.Local) %>% 
+  
+  summarize(O3.Mean = mean(O3.Mean), 
+            CO.Mean = mean(CO.Mean), 
+            NO2.Mean = mean(NO2.Mean),
+            SO2.Mean = mean(SO2.Mean))
+#number of years from start of data (2000)
+counties$Years <- as.integer(year(counties$Date.Local)) - 2000
+counties <- counties %>% mutate(InSuffolk = case_when(
+  (County == 'Suffolk') ~ "yes", .default = "no"))
+
+# add hazard level based off of daily concentration mean for each pollutant
+counties <- counties %>% 
+   mutate(O3.Level = case_when(
+    (O3.Mean <= .054) ~ "good",
+    (O3.Mean <= .07) ~ "moderate",
+    (O3.Mean <= .085) ~ "unhealthy for sg",
+    (O3.Mean <= .105) ~ "unhealthy",
+    (O3.Mean <= .2)~ "very unhealthy",
+    (O3.Mean > .2) ~ "hazardous"),
+    CO.Level = case_when(
+    (CO.Mean <= 4.4) ~ "good",
+    (CO.Mean <= 9.4) ~ "moderate",
+    (CO.Mean <= 12.4) ~ "unhealthy for sg",
+    (CO.Mean <= 15.4) ~ "unhealthy",
+    (CO.Mean <= 30.4) ~ "very unhealthy",
+    (CO.Mean > 30.4) ~ "hazardous"),
+    SO2.Level = case_when(
+    (SO2.Mean <= 35) ~ "good",
+    (SO2.Mean <= 75) ~ "moderate",
+    (SO2.Mean <= 185) ~ "unhealthy for sg",
+    (SO2.Mean <= 304) ~ "unhealthy",
+    (SO2.Mean <= 604) ~ "very unhealthy",
+    (SO2.Mean > 604) ~ "hazardous"),
+    NO2.Level = case_when(
+      (NO2.Mean <= 53) ~ "good",
+      (NO2.Mean <= 100) ~ "moderate",
+      (NO2.Mean <= 360) ~ "unhealthy for sg",
+      (NO2.Mean <= 649) ~ "unhealthy",
+      (NO2.Mean <= 1249) ~ "very unhealthy",
+      (NO2.Mean > 1249) ~ "hazardous")
+  )
+head(counties, 10)
+```
+
+# we take the sqrt because of O3 qq plot and it reduces the overall mse of the ols model 
+```{r}
+counties$sqrt.O3.Mean <- sqrt(counties$O3.Mean)
+counties <- counties %>% 
+  dplyr::select(c(County, CO.Mean,
+                  SO2.Mean, NO2.Mean, sqrt.O3.Mean, Years)) 
+
+```
+
+```{r}
+#Predicting CO.Mean
+X <- counties %>% dplyr::select(-CO.Mean)
+#dummify counties
+dumb <- caret::dummyVars(" ~ .", data = X)
+X <- data.frame(intercept = 1, predict(dumb, X))
+# removing reference group
+X <- X %>% dplyr::select(-CountySuffolk)
+X <- as.matrix(X)
+
+#leverage score
+leverage <- diag(X %*% solve(t(X) %*% X) %*% t(X))
+high_lev <- leverage > (2 * ncol(X) / nrow(X))
+sum(high_lev)
+```
+
+We have 480 points (out of 11426 total rows in our train dataset) that are high leverage points
+
+```{r}
+full_model <- lm(CO.Mean ~ ., data = counties)
+resid_full <- residuals(full_model)
+var_hat <- sqrt(sum(resid_full ^ 2) / (nrow(X) - (ncol(X) + 1)))
+studentized <- resid_full / (var_hat * sqrt(1 - leverage))
+studentized <- studentized * sqrt((nrow(X) - (ncol(X) + 1)) / (nrow(X) - ncol(X) - (studentized ^ 2)))
+
+pvalues <- 2 * (1 - pt(abs(studentized), df = nrow(X) - (ncol(X) + 1)))
+
+belowBonferroni <- pvalues < (.05 / nrow(X))
+sum(belowBonferroni)
+```
+
+17 points in the training set are below bonferroni cut off
+
+```{r}
+train <- caret::trainControl(method = "cv", number = 25)
+
+olsT_sqrt <- caret::train(CO.Mean ~ ., method = "lm", trControl = train, data = counties)
+```
+
+```{r}
+
+kfold <- function(v, d) {
+  n = nrow(d)
+  indexs = sample(1:n, n, replace = FALSE)
+  resample = d[indexs, v]
+  ms = rep(0, 10)
+  for (i in 0:9) {
+    vals_d = resample[(1 / 10  * n + 1): ((i + 1)/ 10 * n), ]
+    training = resample[-((i / 10 *n + 1): ((i + 1) / 10 * n)), ]
+    mod = lm(CO.Mean ~ ., data = training)
+    guess = predict(mod, new_data = vals_d)
+    ms[i + 1] = mean((vals_d$CO.Mean - guess) ^ 2)
+  }
+  return(ms)
+}
+
+foward <- summary(regsubsets(CO.Mean ~ ., data = counties, nvmax = 50, method = "forward"))
+backward <- summary(regsubsets(CO.Mean ~ ., data = counties, nvmax = 50, method = "backward"))
+
+pollution_ny <- data.frame(X)
+pollution_ny$CO.Mean <- counties$CO.Mean
+aic_foward <- foward$which[which.min(foward$cp),]
+print(aic_foward)
+faic <- mean(kfold(c(1, 2, 3, 4, 5, 6, 7, 8), pollution_ny))
+print(faic)
+aic_backward <- backward$which[which.min(backward$cp), ]
+print(aic_backward)
+
+baic <- mean(kfold(c(1, 2, 3, 4, 5, 6, 7, 8), pollution_ny))
+print(baic)
+
+bic_forward <- foward$which[which.min(foward$bic), ]
+print(bic_forward)
+fbic <- mean(kfold(c(1,4, 5, 6, 7, 8), pollution_ny))
+print(fbic)
+
+bic_backward <- backward$which[which.min(backward$bic), ]
+print(bic_backward)
+bbic <- mean(kfold(c(1,4, 5, 6, 7, 8), pollution_ny))
+print(bbic)
+
+```
+
+```{r}
+bic_backward <- lm(CO.Mean~ SO2.Mean + NO2.Mean + sqrt.O3.Mean + Years, data = counties)
+summary(bic_backward)
+plot(bic_backward, which  = 1)
+plot(bic_backward, which  = 2)
+plot(bic_backward, which  = 3)
+plot(bic_backward, which  = 4)
+```
+
+
+
+# Exploratory Data Analysis
+
+```{r}
+#plot each pollutant daily concentration for each county
+ggplot(counties, aes(x = Date.Local, y = NO2.Mean)) +
+  geom_point(aes(color = NO2.Level)) + 
+  geom_smooth(se = FALSE) + 
+  facet_wrap(~County) + 
+  scale_color_manual(breaks = c("good", "moderate", "unhealthy for sg",
+                                "unhealthy", "very unhealthy", "hazardous"),
+                     values=c("green", "yellow", "orange", 
+                               "red", "purple", "maroon")) + 
+  ggtitle("Daily NO2 Mean (ppb)") + xlab("Date")
+
+ggplot(counties, aes(x = Date.Local, y = O3.Mean)) +
+  geom_point(aes(color = O3.Level)) + 
+  geom_smooth(se = FALSE) + 
+  facet_wrap(~County) + 
+  scale_color_manual(breaks = c("good", "moderate", "unhealthy for sg",
+                                "unhealthy", "very unhealthy", "hazardous"),
+                     values=c("green", "yellow", "orange", 
+                               "red", "purple", "maroon")) + 
+  ggtitle("Daily O3 Mean (ppm)") + xlab("Date")
+
+ggplot(counties, aes(x = Date.Local, y = SO2.Mean)) +
+  geom_point(aes(color = SO2.Level)) + 
+  geom_smooth(se = FALSE) + 
+  facet_wrap(~County) + 
+  scale_color_manual(breaks = c("good", "moderate", "unhealthy for sg",
+                                "unhealthy", "very unhealthy", "hazardous"),
+                     values=c("green", "yellow", "orange", 
+                               "red", "purple", "maroon")) + 
+  ggtitle("Daily SO2 Mean (ppb)") + xlab("Date")
+ggplot(counties, aes(x = Date.Local, y = CO.Mean)) +
+  geom_point(aes(color = CO.Level)) + 
+  geom_smooth(se = FALSE) + 
+  facet_wrap(~County) + 
+  scale_color_manual(breaks = c("good", "moderate", "unhealthy for sg",
+                                "unhealthy", "very unhealthy", "hazardous"),
+                     values=c("green", "yellow", "orange", 
+                               "red", "purple", "maroon")) + 
+  ggtitle("Daily CO Mean (ppm)") + xlab("Date")
+```
+
+
+```{r}
+#violin plots of daily average concentration of each pollutant within each county
+
+ggplot(data = counties, aes(x = County, y = O3.Mean, fill = County)) +
+  geom_violin(trim = FALSE) + 
+  geom_boxplot(width = 0.1, fill = "white") +
+  ggtitle("Distribution of Daily Average O3 Concentration") + 
+  xlab("New York State County") + 
+  ylab("O3 (ppm)")  + 
+  scale_fill_brewer(palette = "Dark2") + 
+  theme_classic() +
+  theme(legend.position = "none")
+
+ggplot(data = counties, aes(x = County, y = NO2.Mean, fill = County)) +
+  geom_violin(trim = FALSE) + 
+  geom_boxplot(width = 0.1, fill = "white") +
+  ggtitle("Distribution of Daily Average NO2 Concentration (ppb)") + 
+  xlab("New York State County") + 
+  ylab("NO2 (ppb)")  + 
+  scale_fill_brewer(palette = "Dark2") + 
+  theme_classic() +
+  theme(legend.position = "none")
+
+ggplot(data = counties, aes(x = County, y = SO2.Mean, fill = County)) +
+  geom_violin(trim = FALSE) + 
+  geom_boxplot(width = 0.1, fill = "white") +
+  ggtitle("Distribution of Daily Average SO2 Concentration") + 
+  xlab("New York State County") + 
+  ylab("SO2 (ppb)")  + 
+  scale_fill_brewer(palette = "Dark2") + 
+  theme_classic() +
+  theme(legend.position = "none")
+
+
+ggplot(data = counties, aes(x = County, y = CO.Mean, fill = County)) +
+  geom_violin(trim = FALSE) + 
+  geom_boxplot(width = 0.1, fill = "white") +
+  ggtitle("Distribution of Daily Average CO Concentration") + 
+  xlab("New York State County") + 
+  ylab("CO (ppm)")  + 
+  scale_fill_brewer(palette = "Dark2") + 
+  theme_classic() +
+  theme(legend.position = "none")
+
+```
